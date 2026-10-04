@@ -1,4 +1,5 @@
 import asyncio
+from bgtasks import spawn
 import os
 import platform
 import re
@@ -368,7 +369,7 @@ async def _usage_poller(uuid: str, stats_port: int, inst: dict):
                 allowed = await _usage_callback(uuid, delta)
                 if not allowed:
                     logger.warning(f"MTG[{uuid[:8]}]: کوتای ترافیک تمام شده، در حال توقف پروسه...")
-                    asyncio.create_task(stop_instance(uuid))
+                    spawn(stop_instance(uuid))
                     return
             else:
                 logger.debug(f"MTG[{uuid[:8]}]: usage_callback ثبت نشده، دلتای {delta} بایت فقط لاگ شد")
@@ -495,7 +496,7 @@ async def start_instance(
         )
 
         inst["usage_task"] = asyncio.create_task(_usage_poller(uuid, stats_port, inst))
-        asyncio.create_task(_watch_process(uuid, proc))
+        spawn(_watch_process(uuid, proc))
         return inst
 
 

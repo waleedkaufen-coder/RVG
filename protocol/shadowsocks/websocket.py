@@ -5,6 +5,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+from bgtasks import spawn
 import secrets
 from datetime import datetime, timezone
 
@@ -194,7 +195,7 @@ async def shadowsocks_ws_tunnel(ws: WebSocket):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(save_state())
+        spawn(save_state())
 
     except WebSocketDisconnect:
         pass

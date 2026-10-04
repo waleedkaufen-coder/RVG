@@ -5,6 +5,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+from bgtasks import spawn
 import secrets
 from datetime import datetime, timezone
 
@@ -98,7 +99,7 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(save_state())
+        spawn(save_state())
 
     except WebSocketDisconnect:
         pass

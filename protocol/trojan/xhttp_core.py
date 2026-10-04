@@ -10,6 +10,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+from bgtasks import spawn
 import secrets
 import socket
 import time
@@ -292,7 +293,7 @@ _reaper_started = False
 def ensure_reaper():
     global _reaper_started
     if not _reaper_started:
-        asyncio.create_task(_reaper())
+        spawn(_reaper())
         _reaper_started = True
 
 
@@ -343,7 +344,7 @@ async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_ch
     sess["downlink_task"] = asyncio.create_task(
         _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"], conn_id=sess["conn_id"])
     )
-    asyncio.create_task(save_state())
+    spawn(save_state())
 
 
 def _downstream_gen(sess: dict):

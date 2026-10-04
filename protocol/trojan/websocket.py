@@ -5,6 +5,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+from bgtasks import spawn
 import secrets
 from datetime import datetime, timezone
 
@@ -157,7 +158,7 @@ async def trojan_ws_tunnel(ws: WebSocket):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(schedule_save())
+        spawn(schedule_save())
 
     except WebSocketDisconnect as exc:
         logger.info(f"Trojan-WS [{conn_id}] client disconnected: code={getattr(exc,'code',None)}")
