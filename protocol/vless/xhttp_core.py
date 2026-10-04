@@ -216,9 +216,14 @@ async def _check_link(uuid: str):
 
 async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
     """Session بر اساس session_id که خودِ کلاینت در URL فرستاده، lazily ساخته می‌شه."""
+    # لینک باید معتبر باشد، قبل از ساخت هر session/connection (قبلاً فقط با اولین بدنه‌ی غیرخالی چک می‌شد).
+    await _check_link(uuid)
     async with XHTTP_LOCK:
         sess = xhttp_sessions.get(session_id)
         if sess is not None:
+            # session_id را کلاینت انتخاب می‌کند؛ نباید بتوان با uuid دیگری به session کسی وصل شد.
+            if sess["uuid"] != uuid:
+                raise HTTPException(status_code=403, detail="session belongs to another link")
             sess["last_seen"] = time.time()
             return sess
         conn_id = secrets.token_urlsafe(6)

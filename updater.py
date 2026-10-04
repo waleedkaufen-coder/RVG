@@ -284,7 +284,7 @@ async def _download_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[bo
         return False, "ورودی مانیفست ناقص است (path/url خالی)"
     # جلوگیری از path traversal (../ در مسیر فایل)
     target = (APP_DIR / rel).resolve()
-    if not str(target).startswith(str(APP_DIR.resolve())):
+    if not target.is_relative_to(APP_DIR.resolve()):
         return False, f"مسیر غیرمجاز رد شد: {rel}"
     try:
         r = await client.get(url, timeout=30)
