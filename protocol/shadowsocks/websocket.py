@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from netguard import open_public_connection
 from main import (
     LINKS,
     LINKS_LOCK,
@@ -163,7 +164,7 @@ async def shadowsocks_ws_tunnel(ws: WebSocket):
         logger.info(f"➡️  [{conn_id}] SS → {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=10.0
+            open_public_connection(address, port, 10.0), timeout=12.0
         )
         _tune_socket(writer)
 

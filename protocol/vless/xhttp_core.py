@@ -20,6 +20,7 @@ from fastapi import Request, HTTPException
 from starlette.requests import ClientDisconnect
 from fastapi.responses import StreamingResponse
 
+from netguard import open_public_connection
 from main import (
     LINKS,
     LINKS_LOCK,
@@ -177,18 +178,18 @@ def _req_client_ip(request: Request) -> str:
 
 
 
-async def _open_tcp_from_header(first_chunk: bytes, is_trojan: bool = False):
+async def _open_tcp_from_header(first_chunk: bytes, is_trojan: bool = False, expected_uuid: str | None = None):
     if is_trojan:
         pw_hash, command, address, port, payload = await parse_trojan_header(first_chunk)
         resolved_uuid = await find_uuid_by_trojan_hash(pw_hash)
-        if resolved_uuid is None:
+        if resolved_uuid is None or (expected_uuid is not None and resolved_uuid != expected_uuid):
             raise ValueError("trojan auth failed")
     else:
         command, address, port, payload = await parse_vless_header(first_chunk)
 
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
+            open_public_connection(address, port, TCP_CONNECT_TIMEOUT), timeout=TCP_CONNECT_TIMEOUT + 2
         )
     except asyncio.TimeoutError:
         logger.error(f"XHTTP TCP connect TIMEOUT -> {address}:{port} (>{TCP_CONNECT_TIMEOUT}s)")
@@ -356,7 +357,7 @@ async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_ch
     # Trojan-XHTTP نیاز نداره — پروتکل Trojan هیچ response prefix نمی‌خواد
     vless_prefix = not is_trojan
     try:
-        reader, writer, address, port = await _open_tcp_from_header(first_chunk, is_trojan=is_trojan)
+        reader, writer, address, port = await _open_tcp_from_header(first_chunk, is_trojan=is_trojan, expected_uuid=uuid)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"XHTTP[{sess['mode']}] [{session_id[:8]}] connect/parse FAILED: {type(exc).__name__}: {exc}\n{tb}")

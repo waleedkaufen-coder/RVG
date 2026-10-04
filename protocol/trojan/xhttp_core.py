@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from fastapi import Request, HTTPException
 
+from netguard import open_public_connection
 from main import (
     LINKS,
     LINKS_LOCK,
@@ -166,16 +167,17 @@ def _req_client_ip(request: Request) -> str:
 
 
 
-async def _open_tcp_from_trojan_header(first_chunk: bytes):
+async def _open_tcp_from_trojan_header(first_chunk: bytes, expected_uuid: str | None = None):
     """هدر Trojan رو پارس، هش پسورد رو برای احراز هویت resolve و TCP مقصد رو باز می‌کنه."""
     pw_hash, command, address, port, payload = await parse_trojan_header(first_chunk)
     resolved_uuid = await find_uuid_by_trojan_hash(pw_hash)
-    if resolved_uuid is None:
+    # پسورد باید متعلق به همان لینکی باشد که در URL آمده، نه هر لینک معتبر دیگری.
+    if resolved_uuid is None or (expected_uuid is not None and resolved_uuid != expected_uuid):
         raise ValueError("trojan auth failed")
 
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=TROJAN_TCP_CONNECT_TIMEOUT
+            open_public_connection(address, port, TROJAN_TCP_CONNECT_TIMEOUT), timeout=TROJAN_TCP_CONNECT_TIMEOUT + 2
         )
     except asyncio.TimeoutError:
         logger.error(f"Trojan-XHTTP TCP connect TIMEOUT -> {address}:{port} (>{TROJAN_TCP_CONNECT_TIMEOUT}s)")
@@ -329,7 +331,7 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
 
 async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
     try:
-        reader, writer, address, port = await _open_tcp_from_trojan_header(first_chunk)
+        reader, writer, address, port = await _open_tcp_from_trojan_header(first_chunk, expected_uuid=uuid)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"Trojan-XHTTP[{sess['mode']}] [{session_id[:8]}] connect/parse FAILED: {type(exc).__name__}: {exc}\n{tb}")
