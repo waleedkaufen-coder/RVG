@@ -175,11 +175,8 @@ async def _fetch_manifest_from_worker() -> dict:
                 return {"error": "فرمت مانیفست نامعتبر است (کلید version یافت نشد)"}
             if "files" not in data or not isinstance(data["files"], list):
                 return {"error": "فرمت مانیفست نامعتبر است (کلید files یافت نشد)"}
-            return {
-                "version": data.get("version", ""),
-                "description": data.get("description", ""),
-                "files": data.get("files", []),
-            }
+            # کل مانیفست (از جمله signature) برگردانده می‌شود؛ امضا روی همه‌ی فیلدها است.
+            return data
     except httpx.HTTPStatusError as e:
         return {"error": f"HTTP {e.response.status_code} از Worker"}
     except Exception as e:
