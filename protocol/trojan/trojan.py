@@ -43,27 +43,34 @@ QUOTA_CHECK_INTERVAL = 0.25
 
 class _TrojanHashCache:
     """
-    UUID → trojan_hash رو cache می‌کنه.
-    هر بار که LINKS تغییر کنه (UUID اضافه/حذف بشه) باید invalidate بشه.
-    از اونجا که LINKS یه dict ساده‌ست و تغییراتش نادره، ما فقط
-    snapshot اندازه رو نگه می‌داریم و اگه عوض شد rebuild می‌کنیم.
+    hash → uuid. به‌جای مقایسه‌ی تعداد لینک‌ها (که با حذف+افزودن هم‌زمان یک لینک
+    قدیمی را در کش نگه می‌داشت)، هر نتیجه با LINKS دوباره تأیید می‌شود و در صورت miss
+    کش حداکثر یک‌بار در ثانیه rebuild می‌شود (جلوگیری از CPU DoS با hash های الکی).
     """
+    REBUILD_MIN_INTERVAL = 1.0
+
     def __init__(self):
         self._cache: dict[str, str] = {}   # hash → uuid
-        self._snapshot_len: int = -1
+        self._last_rebuild: float = 0.0
 
     def _rebuild(self, links_snapshot: dict):
         self._cache = {
             hashlib.sha224(uid.encode()).hexdigest(): uid
             for uid in links_snapshot
         }
-        self._snapshot_len = len(links_snapshot)
+        self._last_rebuild = time.monotonic()
 
     async def find_uuid(self, pw_hash: str) -> str | None:
         async with LINKS_LOCK:
-            if len(LINKS) != self._snapshot_len:
+            uid = self._cache.get(pw_hash)
+            if uid is not None and uid in LINKS:
+                return uid
+            if time.monotonic() - self._last_rebuild >= self.REBUILD_MIN_INTERVAL:
                 self._rebuild(LINKS)
-            return self._cache.get(pw_hash)
+                uid = self._cache.get(pw_hash)
+                if uid is not None:
+                    return uid
+            return None
 
 
 _hash_cache = _TrojanHashCache()
@@ -121,13 +128,10 @@ class _QuotaGate:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _ws_client_ip(ws: WebSocket) -> str:
-    fwd = ws.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = ws.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return ws.client.host if ws.client else "نامشخص"
+    from main import ip_from_headers
+    return ip_from_headers(ws.headers, ws.client)
+
+
 
 
 def trojan_hash(password: str) -> str:

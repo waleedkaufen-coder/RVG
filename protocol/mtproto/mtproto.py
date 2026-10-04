@@ -7,6 +7,7 @@ import secrets
 import shutil
 import socket
 import stat
+import hashlib
 import subprocess
 import tarfile
 import time
@@ -20,6 +21,12 @@ import httpx
 logger = logging.getLogger("RVG-Gateway")
 
 MTG_VERSION = "2.1.7"
+# SHA-256 آرشیوها (مطابق mtg-2.1.7-checksums.txt در ریلیز رسمی). نسخه‌ی MTG_VERSION که
+# عوض شد باید این مقادیر هم عوض شوند؛ آرشیو بدون تطابق هرگز اکسترکت/اجرا نمی‌شود.
+MTG_SHA256 = {
+    "amd64": "af6e0cba65abe8e4e63f6e534cd6f23cc235ff987155a8a7e43e0f5b481a96e2",
+    "arm64": "ca1897c13fbacb4a671b872ff7dad7bc5dc2b09a7d7ed8cac7034df74b5b195a",
+}
 MTG_DIR = Path(os.environ.get("DATA_DIR", "/data")) / "mtg"
 MTG_BIN = MTG_DIR / "mtg"
 CONFIG_DIR = MTG_DIR / "configs"
@@ -95,6 +102,11 @@ async def ensure_mtg_binary() -> bool:
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
             resp = await client.get(url)
             resp.raise_for_status()
+            arch_key = asset.split("-linux-")[1].split(".")[0]
+            expected = MTG_SHA256.get(arch_key)
+            actual = hashlib.sha256(resp.content).hexdigest()
+            if not expected or actual != expected:
+                raise RuntimeError(f"عدم تطابق sha256 آرشیو mtg ({actual})")
             tmp_tar.write_bytes(resp.content)
         with tarfile.open(tmp_tar, "r:gz") as tf:
             member = next((m for m in tf.getmembers() if m.name.endswith("mtg") and m.isfile()), None)

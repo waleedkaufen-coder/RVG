@@ -587,14 +587,25 @@ def build_sub_headers(label: str, used_bytes: int, limit_bytes: int, expires_at:
         "support-url": support_url,
     }
 
+# تعداد پراکسی‌های مورد اعتماد جلوی پنل (Railway = 1). هر پراکسی IP طرف مقابلش را به
+# انتهای X-Forwarded-For اضافه می‌کند، پس مقدار قابل‌اعتماد از انتها شمرده می‌شود و
+# عناصر ابتدایی که کلاینت می‌تواند جعل کند نادیده گرفته می‌شوند. 0 = هدرها نادیده گرفته شوند.
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "1"))
+
+
+def ip_from_headers(headers, client) -> str:
+    if TRUSTED_PROXY_HOPS > 0:
+        fwd = [p.strip() for p in (headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+        if fwd:
+            return fwd[-TRUSTED_PROXY_HOPS] if len(fwd) >= TRUSTED_PROXY_HOPS else fwd[0]
+        real_ip = (headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
+    return client.host if client else "نامشخص"
+
+
 def client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else "نامشخص"
+    return ip_from_headers(request.headers, request.client)
 
 # ── Node linking helpers ──────────────────────────────────────────────────────
 def _b64u_encode(s: str) -> str:

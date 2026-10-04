@@ -108,13 +108,10 @@ class _QuotaGate:
 
 
 def _ws_client_ip(ws: WebSocket) -> str:
-    fwd = ws.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = ws.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return ws.client.host if ws.client else "نامشخص"
+    from main import ip_from_headers
+    return ip_from_headers(ws.headers, ws.client)
+
+
 
 async def parse_vless_header(chunk: bytes):
     if len(chunk) < 24:
