@@ -6,7 +6,7 @@
 # + کش سراسری برای مانیفست تا صرف‌نظر از تعداد کاربران پنل، فشار درخواست به
 #   سرور Worker ثابت و کم بماند (Cloudflare Workers هم سقف رایگان دارن،
 #   پس این کش هنوز لازمه)
-import asyncio, os, time, traceback, re, json, hashlib
+import asyncio, os, time, traceback, re, json, hashlib, base64
 from pathlib import Path
 from collections import deque
 import httpx
@@ -17,6 +17,10 @@ import httpx
 UPDATE_MANIFEST_URL = os.environ.get(
     "UPDATE_MANIFEST_URL", "https://rvg-update.arvin341az.workers.dev/version.json"
 )
+
+# کلید عمومی Ed25519 (base64 خام ۳۲ بایتی) برای تأیید امضای مانیفست. بدون آن
+# بروزرسانی انجام نمی‌شود، چون هر کسی که Worker/URL را کنترل کند می‌تواند کد اجرا کند.
+UPDATE_PUBLIC_KEY = os.environ.get("UPDATE_PUBLIC_KEY", "").strip()
 
 APP_DIR = Path(os.environ.get("APP_DIR", os.getcwd()))
 LOCAL_VERSION_FILE = APP_DIR / "version.txt"
@@ -250,12 +254,35 @@ def _save_update_history_entry(entry: dict):
         _log(f"⚠️ خطا در ذخیره‌ی تاریخچه‌ی بروزرسانی: {e}")
 
 
+def verify_manifest_signature(manifest: dict) -> str | None:
+    """امضای Ed25519 مانیفست را بررسی می‌کند. در صورت موفقیت None، وگرنه پیام خطا.
+    امضا روی JSON کانونیک (sort_keys، جداکننده‌ی فشرده، UTF-8) کل مانیفست بدون فیلد
+    «signature» است و به‌صورت base64 در همان فیلد قرار می‌گیرد."""
+    if not UPDATE_PUBLIC_KEY:
+        return "UPDATE_PUBLIC_KEY تنظیم نشده؛ بروزرسانی بدون تأیید امضا مجاز نیست"
+    sig_b64 = manifest.get("signature")
+    if not isinstance(sig_b64, str) or not sig_b64:
+        return "مانیفست امضا ندارد"
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(UPDATE_PUBLIC_KEY))
+        payload = {k: v for k, v in manifest.items() if k != "signature"}
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        pub.verify(base64.b64decode(sig_b64), data)
+    except InvalidSignature:
+        return "امضای مانیفست نامعتبر است"
+    except Exception as e:
+        return f"خطا در تأیید امضا: {e}"
+    return None
+
+
 async def _download_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[bool, str]:
     """یک فایل از مانیفست رو دانلود و روی دیسک (APP_DIR/path) می‌نویسه.
     خروجی: (موفق؟, پیام خطا در صورت شکست)"""
     rel = entry.get("path", "").lstrip("/")
     url = entry.get("url", "")
-    expected_sha1 = entry.get("sha1")
+    expected_sha256 = entry.get("sha256")
     if not rel or not url:
         return False, "ورودی مانیفست ناقص است (path/url خالی)"
     # جلوگیری از path traversal (../ در مسیر فایل)
@@ -266,10 +293,10 @@ async def _download_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[bo
         r = await client.get(url, timeout=30)
         r.raise_for_status()
         content = r.content
-        if expected_sha1:
-            actual = hashlib.sha1(content).hexdigest()
-            if actual != expected_sha1:
-                return False, f"عدم تطابق sha1 برای {rel} (دانلود ناقص/خراب)"
+        if not expected_sha256:
+            return False, f"sha256 برای {rel} در مانیفست امضاشده وجود ندارد"
+        if hashlib.sha256(content).hexdigest() != str(expected_sha256).lower():
+            return False, f"عدم تطابق sha256 برای {rel} (دانلود ناقص/دستکاری‌شده)"
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp_target = target.with_name(target.name + ".rvgtmp")
         tmp_target.write_bytes(content)
@@ -313,6 +340,16 @@ async def perform_update() -> bool:
             "description": "",
             "status": "err",
             "error": manifest["error"],
+        })
+        return False
+
+    sig_err = verify_manifest_signature(manifest)
+    if sig_err:
+        _log(f"❌ {sig_err}؛ بروزرسانی لغو شد.")
+        update_state["running"] = False
+        _save_update_history_entry({
+            "time": time.time(), "from_version": old_version, "to_version": "نامشخص",
+            "description": "", "status": "err", "error": sig_err,
         })
         return False
 

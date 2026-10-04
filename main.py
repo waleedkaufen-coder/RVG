@@ -233,7 +233,19 @@ SESSION_TTL = 60 * 60 * 24 * 7
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
+def _initial_admin_password() -> str:
+    pw = os.environ.get("ADMIN_PASSWORD")
+    if pw:
+        return pw
+    # بدون ADMIN_PASSWORD رمز پیش‌فرض شناخته‌شده نداریم؛ رمز تصادفی ساخته و فقط در لاگ چاپ می‌شود.
+    pw = secrets.token_urlsafe(12)
+    logger.warning(
+        "ADMIN_PASSWORD تنظیم نشده؛ رمز موقت ادمین ساخته شد: %s — "
+        "بعد از ورود از بخش تغییر رمز آن را عوض کنید یا ADMIN_PASSWORD را ست کنید.", pw
+    )
+    return pw
+
+AUTH = {"password_hash": hash_password(_initial_admin_password())}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -2160,7 +2172,7 @@ _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
         "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
 
 @app.api_route("/proxy/{target_url:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
-async def http_proxy(target_url: str, request: Request):
+async def http_proxy(target_url: str, request: Request, _=Depends(require_auth)):
     if not target_url.startswith("http"):
         target_url = "https://" + target_url
     try:
