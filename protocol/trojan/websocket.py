@@ -53,8 +53,10 @@ async def _relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id:
             # drain فقط وقتی واقعاً بافر پر باشه، نه هر بار
             if writer.transport.get_write_buffer_size() > WRITE_HIGH_WATER:
                 await writer.drain()
-    except (WebSocketDisconnect, Exception):
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"Trojan relay ws→tcp [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
         try:
@@ -78,8 +80,10 @@ async def _relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id:
             if conn is not None:
                 conn["bytes"] += len(data)
             await ws.send_bytes(data)
-    except Exception:
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"Trojan relay tcp→ws [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
 

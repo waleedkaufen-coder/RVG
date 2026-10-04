@@ -12,6 +12,7 @@
 
 import asyncio
 import hashlib
+import ipaddress
 import socket
 import time
 
@@ -173,20 +174,31 @@ async def parse_trojan_header(chunk: bytes):
     pos += 2
 
     command = chunk[pos]; pos += 1
+    if command != 1:
+        raise ValueError(f"unsupported trojan command {command} (only CONNECT is supported)")
     atyp = chunk[pos]; pos += 1
 
     if atyp == 1:
+        if len(chunk) < pos + 4:
+            raise ValueError("truncated ipv4 address")
         address = ".".join(str(b) for b in chunk[pos:pos + 4]); pos += 4
     elif atyp == 3:
-        dlen = chunk[pos]; pos += 1
-        address = chunk[pos:pos + dlen].decode("utf-8", errors="ignore"); pos += dlen
+        dlen = chunk[pos] if len(chunk) > pos else 0; pos += 1
+        if dlen == 0 or len(chunk) < pos + dlen:
+            raise ValueError("bad domain length")
+        address = chunk[pos:pos + dlen].decode("utf-8"); pos += dlen
     elif atyp == 4:
-        ab = chunk[pos:pos + 16]; pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+        if len(chunk) < pos + 16:
+            raise ValueError("truncated ipv6 address")
+        address = str(ipaddress.IPv6Address(chunk[pos:pos + 16])); pos += 16
     else:
         raise ValueError(f"unknown trojan atyp: {atyp}")
 
+    if len(chunk) < pos + 4:
+        raise ValueError("truncated trojan header")
     port = int.from_bytes(chunk[pos:pos + 2], "big"); pos += 2
+    if port == 0:
+        raise ValueError("invalid port 0")
 
     if chunk[pos:pos + 2] != b"\r\n":
         raise ValueError("invalid trojan header: missing trailing CRLF")

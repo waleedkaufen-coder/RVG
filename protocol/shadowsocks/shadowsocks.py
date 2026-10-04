@@ -3,6 +3,7 @@ import asyncio
 import functools
 import hashlib
 import hmac
+import ipaddress
 import secrets
 import socket
 import struct
@@ -177,17 +178,18 @@ def parse_socks5_addr(buf: bytes):
         address = ".".join(str(b) for b in buf[pos:pos + 4]); pos += 4
     elif atyp == 3:
         dlen = buf[pos]; pos += 1
-        if len(buf) < pos + dlen + 2:
-            raise ValueError("short domain")
-        address = buf[pos:pos + dlen].decode("utf-8", errors="ignore"); pos += dlen
+        if dlen == 0 or len(buf) < pos + dlen + 2:
+            raise ValueError("bad domain length")
+        address = buf[pos:pos + dlen].decode("utf-8"); pos += dlen
     elif atyp == 4:
         if len(buf) < pos + 16 + 2:
             raise ValueError("short ipv6")
-        ab = buf[pos:pos + 16]; pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+        address = str(ipaddress.IPv6Address(buf[pos:pos + 16])); pos += 16
     else:
         raise ValueError(f"unknown atyp {atyp}")
     port = int.from_bytes(buf[pos:pos + 2], "big"); pos += 2
+    if port == 0:
+        raise ValueError("invalid port 0")
     return address, port, pos
 
 

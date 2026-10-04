@@ -61,8 +61,10 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, stream: _
                 return
             if writer.transport.get_write_buffer_size() > WRITE_HIGH_WATER:
                 await writer.drain()
-    except (WebSocketDisconnect, Exception):
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"SS relay ws→tcp [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
         try:
@@ -86,8 +88,10 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, stream: _
                 conn["bytes"] += len(data)
             frame = stream.encrypt_chunk(data)
             await ws.send_bytes(frame)
-    except Exception:
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"SS relay tcp→ws [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
 

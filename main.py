@@ -30,7 +30,6 @@ import json
 import os
 import hashlib
 import secrets
-import sys
 import time
 import central
 import aiofiles
