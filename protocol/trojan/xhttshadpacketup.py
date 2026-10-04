@@ -24,6 +24,19 @@ from protocol.trojan.xhttp_core import (
 
 router = APIRouter()
 
+# سقف بافر بسته‌های خارج از ترتیب برای هر session (جلوگیری از پر شدن حافظه با seq های بزرگ)
+SEQ_BUF_MAX_PACKETS = 256
+SEQ_BUF_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _buffer_packet(sess: dict, seq: int, body: bytes):
+    buf = sess["seq_buf"]
+    old = len(buf.get(seq, b""))
+    if (len(buf) >= SEQ_BUF_MAX_PACKETS and seq not in buf) or \
+            sum(len(v) for v in buf.values()) - old + len(body) > SEQ_BUF_MAX_BYTES:
+        raise ValueError("packet-up reorder buffer limit exceeded")
+    buf[seq] = body
+
 
 @router.post("/txhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
 async def trojan_packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
@@ -52,7 +65,7 @@ async def trojan_packet_up_upload(uuid: str, session_id: str, seq: int, request:
     try:
         if sess["writer"] is None:
             if seq != 0:
-                sess["seq_buf"][seq] = body
+                _buffer_packet(sess, seq, body)
                 return {"ok": True, "buffered": True}
             await _open_tcp_for_session(session_id, uuid, sess, body)
             nxt = 1
@@ -77,7 +90,7 @@ async def trojan_packet_up_upload(uuid: str, session_id: str, seq: int, request:
                 sess["writer"].write(pending)
                 sess["next_seq"] += 1
         else:
-            sess["seq_buf"][seq] = body
+            _buffer_packet(sess, seq, body)
 
         if sess["writer"].transport.get_write_buffer_size() > TROJAN_PACKET_UP_HIGH_WATER:
             await sess["writer"].drain()

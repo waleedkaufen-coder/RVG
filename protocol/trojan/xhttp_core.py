@@ -10,6 +10,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+from bgtasks import spawn
 import secrets
 import socket
 import time
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 
 from fastapi import Request, HTTPException
 
+from netguard import open_public_connection
 from main import (
     LINKS,
     LINKS_LOCK,
@@ -160,25 +162,23 @@ class _TrojanAdaptiveFlow:
 
 
 def _req_client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else "نامشخص"
+    from main import ip_from_headers
+    return ip_from_headers(request.headers, request.client)
 
 
-async def _open_tcp_from_trojan_header(first_chunk: bytes):
+
+
+async def _open_tcp_from_trojan_header(first_chunk: bytes, expected_uuid: str | None = None):
     """هدر Trojan رو پارس، هش پسورد رو برای احراز هویت resolve و TCP مقصد رو باز می‌کنه."""
     pw_hash, command, address, port, payload = await parse_trojan_header(first_chunk)
     resolved_uuid = await find_uuid_by_trojan_hash(pw_hash)
-    if resolved_uuid is None:
+    # پسورد باید متعلق به همان لینکی باشد که در URL آمده، نه هر لینک معتبر دیگری.
+    if resolved_uuid is None or (expected_uuid is not None and resolved_uuid != expected_uuid):
         raise ValueError("trojan auth failed")
 
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=TROJAN_TCP_CONNECT_TIMEOUT
+            open_public_connection(address, port, TROJAN_TCP_CONNECT_TIMEOUT), timeout=TROJAN_TCP_CONNECT_TIMEOUT + 2
         )
     except asyncio.TimeoutError:
         logger.error(f"Trojan-XHTTP TCP connect TIMEOUT -> {address}:{port} (>{TROJAN_TCP_CONNECT_TIMEOUT}s)")
@@ -204,9 +204,14 @@ async def _check_link(uuid: str):
 
 async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str = "نامشخص") -> dict:
     """Session بر اساس session_id که خودِ کلاینت در URL می‌فرسته، lazily ساخته می‌شه."""
+    # لینک باید معتبر باشد، قبل از ساخت هر session/connection (قبلاً فقط با اولین بدنه‌ی غیرخالی چک می‌شد).
+    await _check_link(uuid)
     async with TROJAN_XHTTP_LOCK:
         sess = trojan_xhttp_sessions.get(session_id)
         if sess is not None:
+            # session_id را کلاینت انتخاب می‌کند؛ نباید بتوان با uuid دیگری به session کسی وصل شد.
+            if sess["uuid"] != uuid:
+                raise HTTPException(status_code=403, detail="session belongs to another link")
             sess["last_seen"] = time.time()
             return sess
         conn_id = secrets.token_urlsafe(6)
@@ -288,7 +293,7 @@ _reaper_started = False
 def ensure_reaper():
     global _reaper_started
     if not _reaper_started:
-        asyncio.create_task(_reaper())
+        spawn(_reaper())
         _reaper_started = True
 
 
@@ -327,7 +332,7 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
 
 async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
     try:
-        reader, writer, address, port = await _open_tcp_from_trojan_header(first_chunk)
+        reader, writer, address, port = await _open_tcp_from_trojan_header(first_chunk, expected_uuid=uuid)
     except Exception as exc:
         tb = traceback.format_exc()
         logger.error(f"Trojan-XHTTP[{sess['mode']}] [{session_id[:8]}] connect/parse FAILED: {type(exc).__name__}: {exc}\n{tb}")
@@ -339,7 +344,7 @@ async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_ch
     sess["downlink_task"] = asyncio.create_task(
         _pump_tcp_to_queue(session_id, uuid, reader, sess["down_q"], conn_id=sess["conn_id"])
     )
-    asyncio.create_task(save_state())
+    spawn(save_state())
 
 
 def _downstream_gen(sess: dict):

@@ -9,14 +9,13 @@ CENTRAL_URL = os.environ.get("CENTRAL_URL", "https://panel-rvg.arvin341az.worker
 async def register_instance():
     if not CENTRAL_URL:
         return
-    from main import AUTH, get_host
+    from main import get_host
     from updater import get_current_version
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             await c.post(f"{CENTRAL_URL}/api/register", json={
                 "domain": get_host(),
                 "version": get_current_version(),
-                "panel_password_hash": AUTH["password_hash"],
                 "description": "RVG Gateway instance",
             })
     except Exception:

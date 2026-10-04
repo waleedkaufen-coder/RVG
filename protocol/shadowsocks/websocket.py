@@ -5,11 +5,13 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import asyncio
+from bgtasks import spawn
 import secrets
 from datetime import datetime, timezone
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from netguard import open_public_connection
 from main import (
     LINKS,
     LINKS_LOCK,
@@ -60,8 +62,10 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, stream: _
                 return
             if writer.transport.get_write_buffer_size() > WRITE_HIGH_WATER:
                 await writer.drain()
-    except (WebSocketDisconnect, Exception):
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"SS relay ws→tcp [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
         try:
@@ -85,8 +89,10 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, stream: _
                 conn["bytes"] += len(data)
             frame = stream.encrypt_chunk(data)
             await ws.send_bytes(frame)
-    except Exception:
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"SS relay tcp→ws [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
 
@@ -163,7 +169,7 @@ async def shadowsocks_ws_tunnel(ws: WebSocket):
         logger.info(f"➡️  [{conn_id}] SS → {address}:{port}")
 
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(address, port), timeout=10.0
+            open_public_connection(address, port, 10.0), timeout=12.0
         )
         _tune_socket(writer)
 
@@ -189,7 +195,7 @@ async def shadowsocks_ws_tunnel(ws: WebSocket):
             except asyncio.CancelledError:
                 pass
 
-        asyncio.create_task(save_state())
+        spawn(save_state())
 
     except WebSocketDisconnect:
         pass

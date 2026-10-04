@@ -6,7 +6,7 @@
 # + کش سراسری برای مانیفست تا صرف‌نظر از تعداد کاربران پنل، فشار درخواست به
 #   سرور Worker ثابت و کم بماند (Cloudflare Workers هم سقف رایگان دارن،
 #   پس این کش هنوز لازمه)
-import asyncio, os, time, traceback, re, json, hashlib
+import asyncio, os, time, traceback, re, json, hashlib, base64
 from pathlib import Path
 from collections import deque
 import httpx
@@ -17,6 +17,10 @@ import httpx
 UPDATE_MANIFEST_URL = os.environ.get(
     "UPDATE_MANIFEST_URL", "https://rvg-update.arvin341az.workers.dev/version.json"
 )
+
+# کلید عمومی Ed25519 (base64 خام ۳۲ بایتی) برای تأیید امضای مانیفست. بدون آن
+# بروزرسانی انجام نمی‌شود، چون هر کسی که Worker/URL را کنترل کند می‌تواند کد اجرا کند.
+UPDATE_PUBLIC_KEY = os.environ.get("UPDATE_PUBLIC_KEY", "").strip()
 
 APP_DIR = Path(os.environ.get("APP_DIR", os.getcwd()))
 LOCAL_VERSION_FILE = APP_DIR / "version.txt"
@@ -153,29 +157,18 @@ async def _fetch_manifest_from_worker() -> dict:
                 _log(f"⚠️ پاسخ Worker معتبر (JSON) نبود | content-type={ctype} | status={r.status_code} | طول={len(full)} کاراکتر")
                 if not full:
                     return {"error": "پاسخ Worker کاملاً خالی بود (بررسی کنید route درست تنظیم شده)"}
-                # چون هر خط لاگ جدا نمایش داده می‌شه، متن رو تکه‌تکه (هر تکه ۵۰۰ کاراکتر) چاپ می‌کنیم
-                # تا کل HTML/متن برگشتی رو بدون افتادگی، در باکس لاگ پنل ببینید.
-                CHUNK = 500
-                total_chunks = (len(full) + CHUNK - 1) // CHUNK
-                MAX_CHUNKS = 20  # سقف ~10000 کاراکتر، برای جلوگیری از سنگین شدن لاگ
-                for idx in range(min(total_chunks, MAX_CHUNKS)):
-                    piece = full[idx * CHUNK: (idx + 1) * CHUNK]
-                    _log(f"📄 RAW[{idx+1}/{total_chunks}]: {piece}")
-                if total_chunks > MAX_CHUNKS:
-                    _log(f"📄 RAW: ... ({total_chunks - MAX_CHUNKS} تکه‌ی دیگه بریده شد ...)")
+                # فقط ۵۰۰ کاراکتر اول پاسخ لاگ می‌شه تا لاگ پنل با پاسخ‌های بزرگ پر نشه.
+                _log(f"📄 RAW: {full[:500]}")
                 if full.lstrip().startswith("<"):
-                    return {"error": "Worker به‌جای JSON یک صفحه‌ی HTML برگردوند (احتمالاً خطای Cloudflare) — متن کامل رو در لاگ بالا ببینید"}
-                return {"error": f"پاسخ Worker قابل‌پارس نبود: {je} — متن کامل رو در لاگ بالا ببینید"}
+                    return {"error": "Worker به‌جای JSON یک صفحه‌ی HTML برگردوند (احتمالاً خطای Cloudflare) — ابتدای پاسخ در لاگ بالا ثبت شد"}
+                return {"error": f"پاسخ Worker قابل‌پارس نبود: {je} — ابتدای پاسخ در لاگ بالا ثبت شد"}
 
             if "version" not in data:
                 return {"error": "فرمت مانیفست نامعتبر است (کلید version یافت نشد)"}
             if "files" not in data or not isinstance(data["files"], list):
                 return {"error": "فرمت مانیفست نامعتبر است (کلید files یافت نشد)"}
-            return {
-                "version": data.get("version", ""),
-                "description": data.get("description", ""),
-                "files": data.get("files", []),
-            }
+            # کل مانیفست (از جمله signature) برگردانده می‌شود؛ امضا روی همه‌ی فیلدها است.
+            return data
     except httpx.HTTPStatusError as e:
         return {"error": f"HTTP {e.response.status_code} از Worker"}
     except Exception as e:
@@ -250,33 +243,60 @@ def _save_update_history_entry(entry: dict):
         _log(f"⚠️ خطا در ذخیره‌ی تاریخچه‌ی بروزرسانی: {e}")
 
 
-async def _download_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[bool, str]:
-    """یک فایل از مانیفست رو دانلود و روی دیسک (APP_DIR/path) می‌نویسه.
-    خروجی: (موفق؟, پیام خطا در صورت شکست)"""
+def verify_manifest_signature(manifest: dict) -> str | None:
+    """امضای Ed25519 مانیفست را بررسی می‌کند. در صورت موفقیت None، وگرنه پیام خطا.
+    امضا روی JSON کانونیک (sort_keys، جداکننده‌ی فشرده، UTF-8) کل مانیفست بدون فیلد
+    «signature» است و به‌صورت base64 در همان فیلد قرار می‌گیرد."""
+    if not UPDATE_PUBLIC_KEY:
+        return "UPDATE_PUBLIC_KEY تنظیم نشده؛ بروزرسانی بدون تأیید امضا مجاز نیست"
+    sig_b64 = manifest.get("signature")
+    if not isinstance(sig_b64, str) or not sig_b64:
+        return "مانیفست امضا ندارد"
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(UPDATE_PUBLIC_KEY))
+        payload = {k: v for k, v in manifest.items() if k != "signature"}
+        data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        pub.verify(base64.b64decode(sig_b64), data)
+    except InvalidSignature:
+        return "امضای مانیفست نامعتبر است"
+    except Exception as e:
+        return f"خطا در تأیید امضا: {e}"
+    return None
+
+
+async def _fetch_one_file(client: httpx.AsyncClient, entry: dict) -> tuple[Path | None, bytes, str]:
+    """یک فایل از مانیفست رو دانلود و sha256 رو چک می‌کنه، بدون نوشتن روی دیسک.
+    خروجی: (مسیر مقصد, محتوا, پیام خطا — خالی یعنی موفق)"""
     rel = entry.get("path", "").lstrip("/")
     url = entry.get("url", "")
-    expected_sha1 = entry.get("sha1")
+    expected_sha256 = entry.get("sha256")
     if not rel or not url:
-        return False, "ورودی مانیفست ناقص است (path/url خالی)"
+        return None, b"", "ورودی مانیفست ناقص است (path/url خالی)"
     # جلوگیری از path traversal (../ در مسیر فایل)
     target = (APP_DIR / rel).resolve()
-    if not str(target).startswith(str(APP_DIR.resolve())):
-        return False, f"مسیر غیرمجاز رد شد: {rel}"
+    if not target.is_relative_to(APP_DIR.resolve()):
+        return None, b"", f"مسیر غیرمجاز رد شد: {rel}"
     try:
         r = await client.get(url, timeout=30)
         r.raise_for_status()
         content = r.content
-        if expected_sha1:
-            actual = hashlib.sha1(content).hexdigest()
-            if actual != expected_sha1:
-                return False, f"عدم تطابق sha1 برای {rel} (دانلود ناقص/خراب)"
+        if not expected_sha256:
+            return None, b"", f"sha256 برای {rel} در مانیفست امضاشده وجود ندارد"
+        if hashlib.sha256(content).hexdigest() != str(expected_sha256).lower():
+            return None, b"", f"عدم تطابق sha256 برای {rel} (دانلود ناقص/دستکاری‌شده)"
+        return target, content, ""
+    except Exception as e:
+        return None, b"", str(e)
+
+
+def _write_files(staged: list[tuple[Path, bytes]]):
+    for target, content in staged:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp_target = target.with_name(target.name + ".rvgtmp")
         tmp_target.write_bytes(content)
         os.replace(tmp_target, target)
-        return True, ""
-    except Exception as e:
-        return False, str(e)
 
 
 async def perform_update() -> bool:
@@ -316,9 +336,28 @@ async def perform_update() -> bool:
         })
         return False
 
+    sig_err = verify_manifest_signature(manifest)
+    if sig_err:
+        _log(f"❌ {sig_err}؛ بروزرسانی لغو شد.")
+        update_state["running"] = False
+        _save_update_history_entry({
+            "time": time.time(), "from_version": old_version, "to_version": "نامشخص",
+            "description": "", "status": "err", "error": sig_err,
+        })
+        return False
+
     new_version = manifest.get("version", "")
     new_description = manifest.get("description", "")
     files = manifest.get("files", [])
+    if not is_newer_version(new_version, old_version):
+        msg = f"نسخه‌ی مانیفست ({new_version}) جدیدتر از نسخه‌ی فعلی ({old_version}) نیست؛ بروزرسانی لغو شد."
+        _log(f"❌ {msg}")
+        update_state["running"] = False
+        _save_update_history_entry({
+            "time": time.time(), "from_version": old_version, "to_version": new_version,
+            "description": new_description, "status": "err", "error": msg,
+        })
+        return False
     _log(f"مانیفست دریافت شد. نسخه‌ی مقصد: {new_version} | تعداد فایل‌ها: {len(files)}")
     update_state["progress"] = 15
 
@@ -328,26 +367,26 @@ async def perform_update() -> bool:
         return False
 
     try:
-        written, failed = 0, 0
+        # همه‌ی فایل‌ها اول دانلود و تأیید می‌شن؛ اگر حتی یکی خراب بود هیچ‌چیز روی دیسک
+        # نوشته نمی‌شه تا پنل با ترکیب ناسازگار از نسخه‌ها بالا نیاد.
+        staged: list[tuple[Path, bytes]] = []
         fail_msgs = []
         async with httpx.AsyncClient(follow_redirects=True) as client:
             total = len(files)
             for i, entry in enumerate(files, start=1):
-                ok, err = await _download_one_file(client, entry)
-                if ok:
-                    written += 1
-                else:
-                    failed += 1
+                target, content, err = await _fetch_one_file(client, entry)
+                if err:
                     fail_msgs.append(f"{entry.get('path','?')}: {err}")
                     _log(f"⚠️ خطا در دانلود {entry.get('path','?')}: {err}")
-                # پیشرفت بین 15 تا 90 درصد رو متناسب با تعداد فایل‌ها آپدیت کن
-                update_state["progress"] = 15 + int((i / total) * 75)
+                else:
+                    staged.append((target, content))
+                update_state["progress"] = 15 + int((i / total) * 70)
 
-        _log(f"دانلود تمام شد. نوشته‌شده: {written} | خطادار: {failed}")
-        update_state["progress"] = 92
+        _log(f"دانلود تمام شد. موفق: {len(staged)} | خطادار: {len(fail_msgs)}")
+        update_state["progress"] = 88
 
-        if written == 0:
-            _log("❌ هیچ فایلی با موفقیت دانلود نشد؛ بروزرسانی لغو شد.")
+        if fail_msgs:
+            _log("❌ دانلود کامل نشد؛ هیچ فایلی تغییر نکرد و بروزرسانی لغو شد.")
             update_state["running"] = False
             _save_update_history_entry({
                 "time": time.time(),
@@ -355,9 +394,12 @@ async def perform_update() -> bool:
                 "to_version": new_version,
                 "description": new_description,
                 "status": "err",
-                "error": "; ".join(fail_msgs[:5]) or "دانلود هیچ فایلی موفق نبود",
+                "error": "; ".join(fail_msgs[:5]),
             })
             return False
+
+        _write_files(staged)
+        update_state["progress"] = 92
 
         # نسخه‌ی محلی رو با مقدار جدید بروزرسانی کن (این جایگزین «فایل version.txt
         # داخل ریپو» در روش قبلی گیت‌هابیه، چون اینجا خبری از تارگز کل ریپو نیست)
@@ -378,7 +420,7 @@ async def perform_update() -> bool:
             "to_version": new_version,
             "description": new_description,
             "status": "ok",
-            "note": (f"{failed} فایل با خطا رد شد" if failed else None),
+            "note": None,
         })
         return True
 

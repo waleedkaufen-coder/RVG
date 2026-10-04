@@ -26,11 +26,11 @@ def _install_packages():
 # _install_packages()  # deps preinstalled for local test
 
 import asyncio
+from bgtasks import spawn
 import json
 import os
 import hashlib
 import secrets
-import sys
 import time
 import central
 import aiofiles
@@ -233,7 +233,19 @@ SESSION_TTL = 60 * 60 * 24 * 7
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
+def _initial_admin_password() -> str:
+    pw = os.environ.get("ADMIN_PASSWORD")
+    if pw:
+        return pw
+    # بدون ADMIN_PASSWORD رمز پیش‌فرض شناخته‌شده نداریم؛ رمز تصادفی ساخته و فقط در لاگ چاپ می‌شود.
+    pw = secrets.token_urlsafe(12)
+    logger.warning(
+        "ADMIN_PASSWORD تنظیم نشده؛ رمز موقت ادمین ساخته شد: %s — "
+        "بعد از ورود از بخش تغییر رمز آن را عوض کنید یا ADMIN_PASSWORD را ست کنید.", pw
+    )
+    return pw
+
+AUTH = {"password_hash": hash_password(_initial_admin_password())}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -270,7 +282,7 @@ async def require_auth(request: Request):
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(central.heartbeat_loop())
+    spawn(central.heartbeat_loop())
     global http_client
     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
     timeout = httpx.Timeout(30.0, connect=10.0)
@@ -305,7 +317,7 @@ async def _restart_mtproto_instances():
 
             if (d.get("mtproto_proxy_id") and inst["port"] != old_port
                     and not d.get("mtproto_manual_port", False)):
-                asyncio.create_task(_reattach_mtproto_public_proxy(
+                spawn(_reattach_mtproto_public_proxy(
                     uid, inst["port"], d.get("mtproto_proxy_id"), d.get("label", "")
                 ))
         except Exception as exc:
@@ -341,7 +353,7 @@ async def _attach_mtproto_public_proxy(uid: str, application_port: int, label: s
             LINKS[uid]["mtproto_public_port"] = pub["port"]
             LINKS[uid]["mtproto_proxy_id"] = pub["id"]
             LINKS[uid]["mtproto_public_pending"] = False
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("link", f"TCP Proxy عمومی «{label}» آماده شد ({pub['domain']}:{pub['port']})", "ok")
 
 async def _reattach_mtproto_public_proxy(uid: str, new_port: int, old_proxy_id: Optional[str], label: str):
@@ -400,7 +412,7 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
             link = LINKS.get(uuid)
             if not link:
                 # لینک در حین ری‌استارت حذف شده؛ instance تازه‌ساز را متوقف کن
-                asyncio.create_task(mtproto.stop_instance(uuid))
+                spawn(mtproto.stop_instance(uuid))
                 return
             link["mtproto_port"] = inst["port"]
             link["mtproto_secret"] = inst["secret"]
@@ -412,11 +424,11 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
             )
 
         if old_proxy_id and inst["port"] != old_port and not manual_port:
-            asyncio.create_task(_reattach_mtproto_public_proxy(
+            spawn(_reattach_mtproto_public_proxy(
                 uuid, inst["port"], old_proxy_id, label
             ))
 
-        asyncio.create_task(save_state())
+        spawn(save_state())
         logger.info(
             f"MTProto[{uuid[:8]}]: ad_tag به‌روز شد، instance ری‌استارت شد "
             f"(port={inst['port']}, تغییر پورت={inst['port'] != old_port})"
@@ -430,7 +442,7 @@ async def _update_mtproto_ad_tag(uuid: str, ad_tag: str):
                 LINKS[uuid]["active"] = False
                 LINKS[uuid]["ad_tag_status"] = "error"
         log_activity("link", f"به‌روزرسانی ad_tag برای «{LINKS.get(uuid,{}).get('label','')}» ناموفق بود", "err")
-        asyncio.create_task(save_state())
+        spawn(save_state())
 
 
 @app.on_event("shutdown")
@@ -575,14 +587,25 @@ def build_sub_headers(label: str, used_bytes: int, limit_bytes: int, expires_at:
         "support-url": support_url,
     }
 
+# تعداد پراکسی‌های مورد اعتماد جلوی پنل (Railway = 1). هر پراکسی IP طرف مقابلش را به
+# انتهای X-Forwarded-For اضافه می‌کند، پس مقدار قابل‌اعتماد از انتها شمرده می‌شود و
+# عناصر ابتدایی که کلاینت می‌تواند جعل کند نادیده گرفته می‌شوند. 0 = هدرها نادیده گرفته شوند.
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "1"))
+
+
+def ip_from_headers(headers, client) -> str:
+    if TRUSTED_PROXY_HOPS > 0:
+        fwd = [p.strip() for p in (headers.get("x-forwarded-for") or "").split(",") if p.strip()]
+        if fwd:
+            return fwd[-TRUSTED_PROXY_HOPS] if len(fwd) >= TRUSTED_PROXY_HOPS else fwd[0]
+        real_ip = (headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
+    return client.host if client else "نامشخص"
+
+
 def client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else "نامشخص"
+    return ip_from_headers(request.headers, request.client)
 
 # ── Node linking helpers ──────────────────────────────────────────────────────
 def _b64u_encode(s: str) -> str:
@@ -685,7 +708,7 @@ async def require_node_key(request: Request) -> str:
         entry = NODE_KEYS[matched]
         entry["last_used_at"] = datetime.now().isoformat()
         entry["use_count"] = int(entry.get("use_count", 0)) + 1
-    asyncio.create_task(schedule_save())
+    spawn(schedule_save())
     return matched
 
 # ── Default link ──────────────────────────────────────────────────────────────
@@ -712,7 +735,7 @@ async def ensure_default_link():
                     "sub_id": None,
                     "protocol": DEFAULT_PROTOCOL,
                 }
-                asyncio.create_task(save_state())
+                spawn(save_state())
         _default_link_created = True
 
 # ── Basic endpoints ───────────────────────────────────────────────────────────
@@ -776,7 +799,7 @@ async def _create_sub_core(body: dict) -> dict:
             "link_ids": [],
             "node_link_ids": [],
         }
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("sub", f"گروه «{name}» ساخته شد", "ok")
     host = get_host()
     return {
@@ -861,7 +884,7 @@ async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
                     "source": str(it.get("source") or "")[:60],
                 })
             s["foreign_links"] = clean
-    asyncio.create_task(save_state())
+    spawn(save_state())
     return {"ok": True}
 
 @app.delete("/api/subs/{sub_id}")
@@ -875,7 +898,7 @@ async def delete_sub(sub_id: str, _=Depends(require_auth)):
         for link in LINKS.values():
             if link.get("sub_id") == sub_id:
                 link["sub_id"] = None
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("sub", f"گروه «{name}» حذف شد", "warn")
     return {"ok": True, "deleted": sub_id}
 
@@ -898,7 +921,7 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     async with LINKS_LOCK:
         if link_id in LINKS:
             LINKS[link_id]["sub_id"] = sub_id if action == "add" else None
-    asyncio.create_task(save_state())
+    spawn(save_state())
     return {"ok": True}
 
 # ── مدیریت گروه از راه دور (توسط پنل مرکزی روی این نود) ──────────────────────
@@ -1339,7 +1362,7 @@ async def _create_link_core(body: dict) -> dict:
         link_data["mtproto_manual_port"] = manual_port is not None
         if manual_port is None and bottokentcpproxy.has_saved_token():
             link_data["mtproto_public_pending"] = True
-            asyncio.create_task(_attach_mtproto_public_proxy(uid, inst["port"], label))
+            spawn(_attach_mtproto_public_proxy(uid, inst["port"], label))
 
 
     if protocol == "shadowsocks":
@@ -1359,7 +1382,7 @@ async def _create_link_core(body: dict) -> dict:
                 if uid not in ids:
                     ids.append(uid)
 
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("link", f"کانفیگ «{label}» ساخته شد", "ok")
     host = get_host()
     return {
@@ -1481,7 +1504,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                         LINKS[uid]["mtproto_secret"] = inst["secret"]
                 if (snap.get("mtproto_proxy_id") and inst["port"] != old_port
                         and not snap.get("mtproto_manual_port", False)):
-                    asyncio.create_task(_reattach_mtproto_public_proxy(
+                    spawn(_reattach_mtproto_public_proxy(
                         uid, inst["port"], snap.get("mtproto_proxy_id"), snap.get("label", "")
                     ))
             except Exception as exc:
@@ -1490,10 +1513,10 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                     if uid in LINKS:
                         LINKS[uid]["active"] = False
                 log_activity("link", f"روشن کردن پروکسی تلگرام «{label}» ناموفق بود", "err")
-                asyncio.create_task(save_state())
+                spawn(save_state())
                 raise HTTPException(status_code=502, detail=f"روشن کردن پروکسی تلگرام ناموفق بود: {exc}")
 
-    asyncio.create_task(save_state())
+    spawn(save_state())
     return {"ok": True}
     
 # ===== Endpoint جدید برای به‌روزرسانی ad_tag =====
@@ -1512,7 +1535,7 @@ async def update_ad_tag(uid: str, request: Request, _=Depends(require_auth)):
             raise HTTPException(status_code=400, detail="این کانفیگ MTProto نیست")
         link["ad_tag_status"] = "pending"   # ← جدید
 
-    asyncio.create_task(_update_mtproto_ad_tag(uid, ad_tag))
+    spawn(_update_mtproto_ad_tag(uid, ad_tag))
     log_activity("link", f"درخواست به‌روزرسانی ad_tag برای «{link.get('label','')}» ثبت شد", "info")
     return {"ok": True, "message": "ad_tag در حال اعمال است، پروکسی ری‌استارت می‌شود"}
 
@@ -1543,14 +1566,14 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     if proto == "mtproto":
         await mtproto.stop_instance(uid)
         if proxy_id:
-            asyncio.create_task(bottokentcpproxy.delete_public_proxy(proxy_id))
+            spawn(bottokentcpproxy.delete_public_proxy(proxy_id))
     if sub_id:
         async with SUBS_LOCK:
             if sub_id in SUBS:
                 ids = SUBS[sub_id].get("link_ids", [])
                 if uid in ids:
                     ids.remove(uid)
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
     return {"ok": True, "deleted": uid}
 
@@ -1722,7 +1745,7 @@ async def create_node_key(request: Request, _=Depends(require_auth)):
             "peer_host": None,
             "use_count": 0,
         }
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("node", f"کلید نود «{label}» ساخته شد", "ok")
     return {
         "ok": True, "key_id": key_id, "label": label,
@@ -1755,7 +1778,7 @@ async def update_node_key(key_id: str, request: Request, _=Depends(require_auth)
             entry["revoked"] = not bool(body.get("enabled"))
         label = entry.get("label", key_id[:8])
         revoked = entry["revoked"]
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("node", f"کلید نود «{label}» {'غیرفعال شد' if revoked else 'به‌روزرسانی شد'}",
                  "warn" if revoked else "ok")
     return {"ok": True, "key_id": key_id}
@@ -1769,7 +1792,7 @@ async def revoke_node_key(key_id: str, _=Depends(require_auth)):
             raise HTTPException(status_code=404, detail="key not found")
         label = entry.get("label", key_id[:8])
         del NODE_KEYS[key_id]
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("node", f"کلید نود «{label}» حذف شد", "warn")
     return {"ok": True, "revoked": key_id}
 
@@ -1880,7 +1903,7 @@ async def _fetch_node_snapshot(node_id: str, node: dict, *, fresh: bool = False)
         "logs": payload.get("logs") or [],
     }
     _NODE_CACHE[cache_key] = {"at": time.time(), "data": data}
-    asyncio.create_task(schedule_save())
+    spawn(schedule_save())
     return data
 
 
@@ -1941,7 +1964,7 @@ async def connect_node(request: Request, _=Depends(require_auth)):
     async with NODES_LOCK:
         NODES[node_id] = node
     _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("node", f"به نود «{label}» ({host}) متصل شد", "ok")
     return {"ok": True, "node": _node_public(node_id, node), "peer": info}
 
@@ -1966,7 +1989,7 @@ async def update_node(node_id: str, request: Request, _=Depends(require_auth)):
                     node["share"][p] = bool(share[p])
         snap = dict(node)
     _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
+    spawn(save_state())
     return {"ok": True, "node": _node_public(node_id, snap)}
 
 
@@ -1977,7 +2000,7 @@ async def disconnect_node(node_id: str, _=Depends(require_auth)):
     if node is None:
         raise HTTPException(status_code=404, detail="node not found")
     _NODE_CACHE.clear()
-    asyncio.create_task(save_state())
+    spawn(save_state())
     log_activity("node", f"اتصال نود «{node.get('label')}» قطع شد", "warn")
     return {"ok": True, "disconnected": node_id}
 
@@ -2160,7 +2183,7 @@ _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
         "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
 
 @app.api_route("/proxy/{target_url:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
-async def http_proxy(target_url: str, request: Request):
+async def http_proxy(target_url: str, request: Request, _=Depends(require_auth)):
     if not target_url.startswith("http"):
         target_url = "https://" + target_url
     try:

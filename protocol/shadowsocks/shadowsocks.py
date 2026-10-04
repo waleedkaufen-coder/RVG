@@ -1,7 +1,9 @@
 # shadowsocks.py
 import asyncio
+import functools
 import hashlib
 import hmac
+import ipaddress
 import secrets
 import socket
 import struct
@@ -31,13 +33,10 @@ DEFAULT_CIPHER = "chacha20-ietf-poly1305"
 
 
 def _ws_client_ip(ws: WebSocket) -> str:
-    fwd = ws.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = ws.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return ws.client.host if ws.client else "نامشخص"
+    from main import ip_from_headers
+    return ip_from_headers(ws.headers, ws.client)
+
+
 
 
 def _tune_socket(writer: asyncio.StreamWriter):
@@ -65,6 +64,7 @@ def _hkdf_sha1(key: bytes, salt: bytes, info: bytes, length: int) -> bytes:
     return okm[:length]
 
 
+@functools.lru_cache(maxsize=1024)
 def derive_key(password: str, key_len: int) -> bytes:
     """EVP_BytesToKey سازگار با shadowsocks (مثل قدیم) برای گرفتن master key از پسورد."""
     d = d_prev = b""
@@ -178,22 +178,43 @@ def parse_socks5_addr(buf: bytes):
         address = ".".join(str(b) for b in buf[pos:pos + 4]); pos += 4
     elif atyp == 3:
         dlen = buf[pos]; pos += 1
-        if len(buf) < pos + dlen + 2:
-            raise ValueError("short domain")
-        address = buf[pos:pos + dlen].decode("utf-8", errors="ignore"); pos += dlen
+        if dlen == 0 or len(buf) < pos + dlen + 2:
+            raise ValueError("bad domain length")
+        address = buf[pos:pos + dlen].decode("utf-8"); pos += dlen
     elif atyp == 4:
         if len(buf) < pos + 16 + 2:
             raise ValueError("short ipv6")
-        ab = buf[pos:pos + 16]; pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+        address = str(ipaddress.IPv6Address(buf[pos:pos + 16])); pos += 16
     else:
         raise ValueError(f"unknown atyp {atyp}")
     port = int.from_bytes(buf[pos:pos + 2], "big"); pos += 2
+    if port == 0:
+        raise ValueError("invalid port 0")
     return address, port, pos
 
 
 # ── تشخیص لینک از روی رمزنگاری موفق (چون SS پسورد را در URL/هدر نمی‌فرستد،
 #    باید روی همه‌ی لینک‌های shadowsocks فعال امتحان کنیم تا سالت/تگ جور دربیاید) ──
+# salt هر اتصال معتبر یک‌بار مصرف است؛ تکرار آن یعنی replay. فقط salt اتصال‌های موفق
+# ثبت می‌شود و کش با سقف زمانی/تعدادی محدود می‌ماند.
+_SALT_TTL = 3600.0
+_SALT_MAX = 100_000
+_seen_salts: dict = {}
+
+
+def _is_replayed_salt(salt: bytes) -> bool:
+    now = time.monotonic()
+    if len(_seen_salts) >= _SALT_MAX:
+        for k in [k for k, t in _seen_salts.items() if now - t > _SALT_TTL]:
+            _seen_salts.pop(k, None)
+        if len(_seen_salts) >= _SALT_MAX:
+            _seen_salts.pop(next(iter(_seen_salts)), None)
+    if salt in _seen_salts and now - _seen_salts[salt] <= _SALT_TTL:
+        return True
+    _seen_salts[salt] = now
+    return False
+
+
 async def _find_matching_ss_link(first_bytes: bytes):
     async with LINKS_LOCK:
         candidates = [
@@ -213,6 +234,9 @@ async def _find_matching_ss_link(first_bytes: bytes):
         except ValueError:
             continue
         if chunks:
+            if _is_replayed_salt(first_bytes[: info["salt_len"]]):
+                logger.warning("SS: salt تکراری (replay) رد شد")
+                return None, None, None
             return uid, stream, chunks
     return None, None, None
 

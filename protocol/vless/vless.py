@@ -12,6 +12,7 @@
 #      می‌شد و SO_SNDBUF/SO_RCVBUF اصلاً تنظیم نمی‌شدن)
 
 import asyncio
+import ipaddress
 import socket
 import time
 
@@ -108,31 +109,42 @@ class _QuotaGate:
 
 
 def _ws_client_ip(ws: WebSocket) -> str:
-    fwd = ws.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = ws.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return ws.client.host if ws.client else "نامشخص"
+    from main import ip_from_headers
+    return ip_from_headers(ws.headers, ws.client)
+
+
 
 async def parse_vless_header(chunk: bytes):
+    """هدر درخواست VLESS: ver(1) uuid(16) addon_len(1) addon cmd(1) port(2) atyp(1) addr.
+    همه‌ی طول‌ها قبل از خواندن چک می‌شوند و فقط دستور TCP (1) پذیرفته می‌شود."""
     if len(chunk) < 24:
         raise ValueError("chunk too small")
-    pos = 1
-    pos += 16
+    if chunk[0] != 0:
+        raise ValueError(f"unsupported vless version: {chunk[0]}")
+    pos = 17
     addon_len = chunk[pos]; pos += 1 + addon_len
+    if len(chunk) < pos + 4:
+        raise ValueError("truncated vless header")
     command = chunk[pos]; pos += 1
+    if command != 1:
+        raise ValueError(f"unsupported vless command {command} (only TCP is supported)")
     port = int.from_bytes(chunk[pos:pos+2], "big"); pos += 2
+    if port == 0:
+        raise ValueError("invalid port 0")
     addr_type = chunk[pos]; pos += 1
     if addr_type == 1:
+        if len(chunk) < pos + 4:
+            raise ValueError("truncated ipv4 address")
         address = ".".join(str(b) for b in chunk[pos:pos+4]); pos += 4
     elif addr_type == 2:
-        dlen = chunk[pos]; pos += 1
-        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore"); pos += dlen
+        dlen = chunk[pos] if len(chunk) > pos else 0; pos += 1
+        if dlen == 0 or len(chunk) < pos + dlen:
+            raise ValueError("bad domain length")
+        address = chunk[pos:pos+dlen].decode("utf-8"); pos += dlen
     elif addr_type == 3:
-        ab = chunk[pos:pos+16]; pos += 16
-        address = ":".join(f"{ab[i]:02x}{ab[i+1]:02x}" for i in range(0, 16, 2))
+        if len(chunk) < pos + 16:
+            raise ValueError("truncated ipv6 address")
+        address = str(ipaddress.IPv6Address(chunk[pos:pos+16])); pos += 16
     else:
         raise ValueError(f"unknown addr type: {addr_type}")
     return command, address, port, chunk[pos:]
@@ -170,8 +182,10 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             # drain فقط وقتی واقعاً بافر پر باشه، نه هر بار (کاهش تاخیر)
             if writer.transport.get_write_buffer_size() > WRITE_HIGH_WATER:
                 await writer.drain()
-    except (WebSocketDisconnect, Exception):
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"VLESS relay ws→tcp [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
         try:
@@ -199,8 +213,10 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             else:
                 payload = data
             await ws.send_bytes(payload)
-    except Exception:
-        pass
+    except (WebSocketDisconnect, ConnectionError, RuntimeError):
+        pass  # قطع عادی (کلاینت/مقصد اتصال را بست)
+    except Exception as exc:
+        logger.warning(f"VLESS relay tcp→ws [{conn_id}]: {type(exc).__name__}: {exc}")
     finally:
         await gate.flush()
 
